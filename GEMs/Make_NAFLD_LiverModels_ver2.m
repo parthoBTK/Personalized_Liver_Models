@@ -1,0 +1,481 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Author: Partho Sen 
+% Description: The script loads HTiMMR.mat model and contextualize it based on
+% transcriptomics data
+%
+% N.B: Cobra (https://opencobra.github.io/cobratoolbox/stable/) 
+% and RAVEN toolbox (https://github.com/SysBioChalmers/RAVEN) should be included in the path of MATLAB.
+% 
+% Install ibm_cplex solver in the path of cobra-Matlab toolbox (see documentation)
+% Install MOSEK solver in the path of raven-Matlab (see documentation)
+%
+% For better performance, implement the script in the HPC cluster (p -4 and t -4)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+clear; close all; clc;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+uu=1;
+if uu
+disp('Loading gene expression datasets ....')
+
+%%% N:B: the transcriptomics data was obtained from [Olivier Govaere et al., Sci Transl Med. 2020 Dec 2;12(572):eaba4448.] 
+%%% Due to copyright these datasets are not included in the GitHub /data folder;
+%%% Therefore, the "/data" folder is kept empty!
+%%% These data objects can be obtained from the lead author %%%
+
+load('Data/Genes')
+load('Data/Conditions'); Conditions_temp = Conditions;
+load('Data/expression_all')
+
+disp('done!')
+
+end
+
+
+disp('Getting indices for NAFLD conditions from the data type...')
+
+ind_Steatosis  = find(contains(Conditions,'Steatosis')); %% NAFL % 51
+ind_NASH_F01 = find(contains(Conditions,'NASH_F0_1')); %% 34 %% Steatohepatitis NASH
+ind_NASH_F2 = find(contains(Conditions,'NASH_F2')); %% 53 %%
+ind_NASH_F3 = find(contains(Conditions,'NASH_F3')); %% 54 %%
+ind_Cirrhosis = find(contains(Conditions,'Cirrhosis')); %% 14 %%
+
+
+%%% Everything vs. "Steatosis / NAFL" (NAS < 3) vs. Fibrosis (NAS > 5)  %%%%%%%%%%%%%
+NAFL_Stea = [expression_all(:,ind_Steatosis)]; Condi_NAFL_Stea = Conditions([ind_Steatosis]); %% size(Stea) = 51
+NASH_F01 = [expression_all(:,ind_NASH_F01)]; Condi_NASH_F01 = Conditions([ind_NASH_F01]); %% 34
+NASH_F2 = [expression_all(:,ind_NASH_F2)]; Condi_NASH_F2 = Conditions([ind_NASH_F2]); %% 53
+NASH_F3 = [expression_all(:,ind_NASH_F3)]; Condi_NASH_F3 = Conditions([ind_NASH_F3]); %% 54
+NASH_F4 = [expression_all(:,ind_Cirrhosis)]; Condi_NASH_F4 = Conditions([ind_Cirrhosis]); %% 14
+
+disp('Pooling the groups for comparision ....')
+
+%%% Combine datasets for modelling and comparision "Steatosis + NASH_F01" %%%
+Stea_NASH_F01 = [expression_all(:,ind_Steatosis),expression_all(:,ind_NASH_F01)];  Condi_Stea_NASH_F01 = Conditions([ind_Steatosis,ind_NASH_F01]);
+
+%%% Combine datasets for modelling and comparision "Steatosis + NASH_F01 + NASH_F02" %%%
+Stea_NASH_F012 = [expression_all(:,ind_Steatosis),expression_all(:,ind_NASH_F01),expression_all(:,ind_NASH_F2)];  Condi_Stea_NASH_F012 = Conditions([ind_Steatosis,ind_NASH_F01,ind_NASH_F2]); 
+
+%%% Combine datasets for modelling and comparision "NASH_F2 + NASH_F3" %%%
+NASH_F23 = [expression_all(:,ind_NASH_F2),expression_all(:,ind_NASH_F3)];  Condi_NASH_F23 = Conditions([ind_NASH_F2,ind_NASH_F3]); 
+
+%%% Combine datasets for modelling and comparision "NASH_F3 + NASH_F4" %%%
+NASH_F34 = [expression_all(:,ind_NASH_F3),expression_all(:,ind_Cirrhosis)];  Condi_NASH_F34 = Conditions([ind_NASH_F3,ind_Cirrhosis]); 
+
+disp('done!')
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Load HMR 2.0 generic liver model (https://www.nature.com/articles/ncomms4083)  %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%%% N:B: the HMR models in Cobra and Raven formats was obtained from [Mardinoglu et al., Nat Commun. 2014;5:3083. doi: 10.1038/ncomms4083]
+%%% Due to copyright these models are not included in the /model folder;
+%%% Therefore, the "/model" folder is kept empty!
+
+disp('HMR2 in cobra and raven formats... from "[Mardinoglu et al., Nat Commun. 2014;5:3083. doi: 10.1038/ncomms4083]" ')
+
+disp('Load GEMs both in RAVEN and Cobra formats ....')
+
+load('Models/HMR2_Cobra.mat'); 
+load('Models/HMR2_RAVEN.mat'); 
+
+Ref_HMR2_Cobra = HMR2_Cobra; %% For contextualization using GIMME and E-Flux
+Ref_HMR2_RAVEN = HMR2_RAVEN; %% For gapFilling, Check and Fit Taks; Model QCs and Curations
+
+Ref_HMR2_RAVEN.id = "HMR_2.00_RAVEN";
+Ref_HMR2_Cobra.id = "HMR_2.00_Cobra";
+
+Ref_HMR2_RAVEN.c(find(ismember(Ref_HMR2_RAVEN.rxns,'biomass_components')))=1; %% may not be used here 
+Ref_HMR2_Cobra.c(find(ismember(Ref_HMR2_Cobra.rxns,'biomass_components')))=1; %% set biomass components pre-requisite for the GIMME 
+
+disp('done!')
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%% Contextualize models %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+uu=1;
+if uu
+Rxns_genes_GIMME = {};
+Rxns_genes_EFLUX = {};
+Rxns_genes_RS_GIMME = {};
+Rxns_genes_RS_EFLUX = {};
+
+Cutoff = 1; %% GIMME threshold (N:B log2 gene expression data); %% based on histogram
+
+%%% *** NAFL_Stea section: Cobra Models *** %%%
+uu=1;
+if uu
+disp('Create condition-specific Genotype liver GEMs NAFL ..)')
+ind = 1:size(NAFL_Stea,2);
+
+[NAFL_Stea,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NAFL_Stea,ind,'NAFL_Stea',Cutoff);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+Rxns_genes_GIMME{1} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{1} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{1} = RS_GIMME;
+Rxns_genes_RS_EFLUX{1} = RS_EFLUX;
+
+disp('done!');
+
+end
+
+
+%%% *** NASH_F01 section : Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs NASH_F01 ..)')
+ind = 1:size(NASH_F01,2);
+[NASH_F01,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NASH_F01,ind,'NASH_F01',Cutoff);
+
+Rxns_genes_GIMME{2} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{2} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{2} = RS_GIMME;
+Rxns_genes_RS_EFLUX{2} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** NASH_F2 section: Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs NASH_F2 ..)')
+ind = 1:size(NASH_F2,2);
+[NASH_F2,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NASH_F2,ind,'NASH_F2',Cutoff);
+
+Rxns_genes_GIMME{3} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{3} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{3} = RS_GIMME;
+Rxns_genes_RS_EFLUX{3} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** NASH_F3 section : Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs NASH_F3 ..)')
+ind = 1:size(NASH_F3,2);
+[NASH_F3,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NASH_F3,ind,'NASH_F3',Cutoff);
+
+Rxns_genes_GIMME{4} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{4} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{4} = RS_GIMME;
+Rxns_genes_RS_EFLUX{4} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** NASH_F4 section : : Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs NASH_F4 ..)')
+ind = 1:size(NASH_F4,2);
+
+[NASH_F4,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NASH_F4,ind,'NASH_F4',Cutoff);
+
+Rxns_genes_GIMME{5} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{5} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{5} = RS_GIMME;
+Rxns_genes_RS_EFLUX{5} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** Stea_NASH_F01 section : : Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs Stea_NASH_F01 ..)')
+ind = 1:size(Stea_NASH_F01,2);
+[Stea_NASH_F01,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,Stea_NASH_F01,ind,'Stea_NASH_F01',Cutoff);
+
+Rxns_genes_GIMME{6} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{6} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{6} = RS_GIMME;
+Rxns_genes_RS_EFLUX{6} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** NASH_Stea_F012 section : : Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs Stea_NASH_F012 ..)')
+ind = 1:size(Stea_NASH_F012,2);
+[Stea_NASH_F012,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,Stea_NASH_F012,ind,'Stea_NASH_F012',Cutoff);
+
+Rxns_genes_GIMME{7} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{7} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{7} = RS_GIMME;
+Rxns_genes_RS_EFLUX{7} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** NASH_F23 section:: Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs NASH_F23 ..)')
+ind = 1:size(NASH_F23,2);
+
+[NASH_F23,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NASH_F23,ind,'NASH_F23',Cutoff);
+
+Rxns_genes_GIMME{8} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{8} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{8} = RS_GIMME;
+Rxns_genes_RS_EFLUX{8} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%% *** NASH_F34 section: : Cobra Models *** %%%
+uu=0;
+if uu
+disp('Create condition-specific Genotype liver GEMs NASH_F34 ..)')
+ind = 1:size(NASH_F34,2);
+[NASH_F34,RS_GIMME,RS_EFLUX,genes_rxns_GIMME,genes_rxns_Eflux] = ConditionSpecificEfluxGIMME(Ref_HMR2_Cobra,Genes,NASH_F34,ind,'NASH_F34',Cutoff);
+
+Rxns_genes_GIMME{9} = genes_rxns_GIMME;
+Rxns_genes_EFLUX{9} = genes_rxns_Eflux;
+Rxns_genes_RS_GIMME{9} = RS_GIMME;
+Rxns_genes_RS_EFLUX{9} = RS_EFLUX;
+
+disp('done!');
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+disp('Saving draft Cobra models ...')
+
+save('Models/Contextualized/Cobra_draft/NAFL_Stea.mat','NAFL_Stea');
+save('Models/Contextualized/Cobra_draft/NASH_F01.mat','NASH_F01');
+save('Models/Contextualized/Cobra_draft/NASH_F2.mat','NASH_F2');
+save('Models/Contextualized/Cobra_draft/NASH_F3.mat','NASH_F3');
+save('Models/Contextualized/Cobra_draft/NASH_F4.mat','NASH_F4');
+
+save('Models/Contextualized/Cobra_draft/Stea_NASH_F01.mat','Stea_NASH_F01');
+save('Models/Contextualized/Cobra_draft/Stea_NASH_F012.mat','Stea_NASH_F012');
+save('Models/Contextualized/Cobra_draft/NASH_F23.mat','NASH_F23');
+save('Models/Contextualized/Cobra_draft/NASH_F34.mat','NASH_F34');
+
+disp('Store all related reaction scores ...')
+
+save('Models/Contextualized/Cobra_draft/Rxns_genes_GIMME.mat','Rxns_genes_GIMME');
+save('Models/Contextualized/Cobra_draft/Rxns_genes_EFLUX.mat','Rxns_genes_EFLUX');
+save('Models/Contextualized/Cobra_draft/Rxns_genes_RS_GIMME.mat','Rxns_genes_RS_GIMME');
+save('Models/Contextualized/Cobra_draft/Rxns_genes_RS_EFLUX.mat','Rxns_genes_RS_EFLUX');
+
+disp('done! End of this section ....')
+disp('Turn off the switch :-')
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%% Load condition-specific cobra models and convert to RAVEN formats, for QC analysis %%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+uu=1;
+if uu
+    
+disp('Loading Cobra models..')
+
+load('Models/Contextualized/Cobra_draft/NAFL_Stea.mat');
+load('Models/Contextualized/Cobra_draft/NASH_F01.mat');
+load('Models/Contextualized/Cobra_draft/NASH_F2.mat');
+load('Models/Contextualized/Cobra_draft/NASH_F3.mat');
+load('Models/Contextualized/Cobra_draft/NASH_F4.mat');
+
+load('Models/Contextualized/Cobra_draft/Stea_NASH_F01.mat');
+load('Models/Contextualized/Cobra_draft/Stea_NASH_F012.mat');
+load('Models/Contextualized/Cobra_draft/NASH_F23.mat');
+load('Models/Contextualized/Cobra_draft/NASH_F34.mat');
+
+disp('Convering Cobra to RAVEN formats for the QC analysis...')
+
+NAFL_Stea = convertCobToRavStandarized(NAFL_Stea,HMR2_RAVEN); %NAFL_Stea.id = 'NAFL_Stea';
+NASH_F01 = convertCobToRavStandarized(NASH_F01,HMR2_RAVEN); %NASH_F01.id = 'NASH_F01';
+NASH_F2 = convertCobToRavStandarized(NASH_F2,HMR2_RAVEN); %NASH_F2.id = 'NASH_F2';
+NASH_F3 = convertCobToRavStandarized(NASH_F3,HMR2_RAVEN); %NASH_F3.id = 'NASH_F3';
+NASH_F4 = convertCobToRavStandarized(NASH_F4,HMR2_RAVEN); %NASH_F4.id = 'NASH_F4';
+
+Stea_NASH_F01 = convertCobToRavStandarized(Stea_NASH_F01,HMR2_RAVEN); %Stea_NASH_F01.id = 'Stea_NASH_F01';
+Stea_NASH_F012 = convertCobToRavStandarized(Stea_NASH_F012,HMR2_RAVEN); %Stea_NASH_F012.id = 'Stea_NASH_F012';
+NASH_F23 = convertCobToRavStandarized(NASH_F23,HMR2_RAVEN); %NASH_F23.id = 'NASH_F23';
+NASH_F34 = convertCobToRavStandarized(NASH_F34,HMR2_RAVEN); %NASH_F34.id = 'NASH_F34';
+
+disp('done!')
+
+disp('Grouping the models into a cell array....')
+
+REF{1} = NAFL_Stea; 
+REF{2} = NASH_F01; 
+REF{3} = NASH_F2; 
+REF{4} = NASH_F3; 
+REF{5} = NASH_F4; 
+
+REF{6} = Stea_NASH_F01; 
+REF{7} = Stea_NASH_F012; 
+REF{8} = NASH_F23; 
+REF{9} = NASH_F34; 
+
+%%%%%%%%%%%%%%%%%%%%% Necessary Step: Gap filling and fit tasks section by comparing HMR2.00/HTimmR %%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+disp('Adding Essentials.... ')
+
+ref_model{1} = HMR2_RAVEN; %% group reference model 'HMR_RAVEN' into a Cell array!
+
+for ii=1:length(REF)
+ii    
+    REF{ii}.metComps = ref_model{1}.metComps(ismember(ref_model{1}.mets,strtok(cellstr(REF{ii}.mets),'[')));
+    REF{ii}.metNames = ref_model{1}.metNames(ismember(ref_model{1}.mets,strtok(cellstr(REF{ii}.mets),'[')));
+end
+    
+setRavenSolver('mosek');
+
+%%%%%%%%%%%%%%%%% NAFL_Stea : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NAFL_Stea  .... ");
+[NAFL_Stea,addedRxns]=fitTasks(REF{1},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NAFL_Stea.mat','NAFL_Stea');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% NASH_F01 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NASH_F01  .... ");
+[NASH_F01,addedRxns]=fitTasks(REF{2},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NASH_F01.mat','NASH_F01');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% NASH_F2 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NASH_F2  .... ");
+[NASH_F2,addedRxns]=fitTasks(REF{3},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NASH_F2.mat','NASH_F2');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% NASH_F3 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NASH_F3  .... ");
+[NASH_F3,addedRxns]=fitTasks(REF{4},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NASH_F3.mat','NASH_F3');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% NASH_F4 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NASH_F4  .... ");
+[NASH_F4,addedRxns]=fitTasks(REF{5},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NASH_F4.mat','NASH_F4');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% Stea_NASH_F01 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for Stea_NASH_F01  .... ");
+[Stea_NASH_F01,addedRxns]=fitTasks(REF{6},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/Stea_NASH_F01.mat','Stea_NASH_F01');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% Stea_NASH_F012 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for Stea_NASH_F012  .... ");
+[Stea_NASH_F012,addedRxns]=fitTasks(REF{7},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/Stea_NASH_F012.mat','Stea_NASH_F012');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% NASH_F23 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NASH_F23  .... ");
+[NASH_F23,addedRxns]=fitTasks(REF{8},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NASH_F23.mat','NASH_F23');
+disp('done!')
+
+%%%%%%%%%%%%%%%%% NASH_F34 : RAVEN models %%%%%%%%%%%%%%%%%%%%%%
+disp("Fit tasks for NASH_F34  .... ");
+[NASH_F34,addedRxns]=fitTasks(REF{9},ref_model{1},'Data/Metabolic_Task2.xlsx',true);
+save('Models/Contextualized/RAVEN_QC/NASH_F34.mat','NASH_F34');
+disp('done!')
+
+end
+
+%%%%%%%%%%%%%%%%%%%%% Back convert to the Cobra models %%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+uu=1;
+if uu
+    
+disp("Converting back to Cobra Models for future analysis .... ");
+
+NAFL_Stea = convertRavenToCobraStandarized(NAFL_Stea,HMR2_RAVEN); %NAFL_Stea.id = 'NAFL_Stea';
+NASH_F01 = convertRavenToCobraStandarized(NASH_F01,HMR2_RAVEN); %NASH_F01.id = 'NASH_F01';
+NASH_F2 = convertRavenToCobraStandarized(NASH_F2,HMR2_RAVEN); %NASH_F2.id = 'NASH_F2';
+NASH_F3 = convertRavenToCobraStandarized(NASH_F3,HMR2_RAVEN); %NASH_F3.id = 'NASH_F3';
+NASH_F4 = convertRavenToCobraStandarized(NASH_F4,HMR2_RAVEN); %NASH_F4.id = 'NASH_F4';
+
+Stea_NASH_F01 = convertRavenToCobraStandarized(Stea_NASH_F01,HMR2_RAVEN); %Stea_NASH_F01.id = 'Stea_NASH_F01';
+Stea_NASH_F012 = convertRavenToCobraStandarized(Stea_NASH_F012,HMR2_RAVEN); %Stea_NASH_F012.id = 'Stea_NASH_F012';
+NASH_F23 = convertRavenToCobraStandarized(NASH_F23,HMR2_RAVEN); %NASH_F23.id = 'NASH_F23';
+
+NASH_F34 = convertRavenToCobraStandarized(NASH_F34,HMR2_RAVEN); %NASH_F34.id = 'NASH_F34';
+
+disp("Saving Cobra models.... ");
+
+save('Models/Contextualized/Cobra_QC/NAFL_Stea.mat','NAFL_Stea');
+save('Models/Contextualized/Cobra_QC/NASH_F01.mat','NASH_F01');
+save('Models/Contextualized/Cobra_QC/NASH_F2.mat','NASH_F2');
+save('Models/Contextualized/Cobra_QC/NASH_F3.mat','NASH_F3');
+save('Models/Contextualized/Cobra_QC/NASH_F4.mat','NASH_F4');
+
+save('Models/Contextualized/Cobra_QC/Stea_NASH_F01.mat','Stea_NASH_F01');
+save('Models/Contextualized/Cobra_QC/Stea_NASH_F012.mat','Stea_NASH_F012');
+save('Models/Contextualized/Cobra_QC/NASH_F23.mat','NASH_F23');
+save('Models/Contextualized/Cobra_QC/NASH_F34.mat','NASH_F34');
+
+disp("done!");
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+                  %%%%%%%%%%%%%%%%%%%%% Manual Check: Simulation for each model %%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+uu=1;
+if uu
+disp('Load Models (now RAVEN formats) for Simulations ....')
+
+load('Models/Contextualized/Cobra_QC/NAFL_Stea.mat');
+load('Models/Contextualized/Cobra_QC/NASH_F01.mat');   
+load('Models/Contextualized/Cobra_QC/NASH_F2.mat');
+load('Models/Contextualized/Cobra_QC/NASH_F3.mat');   
+load('Models/Contextualized/Cobra_QC/NASH_F4.mat');   
+
+load('Models/Contextualized/Cobra_QC/Stea_NASH_F01.mat');
+load('Models/Contextualized/Cobra_QC/Stea_NASH_F012.mat');   
+load('Models/Contextualized/Cobra_QC/NASH_F23.mat');
+load('Models/Contextualized/Cobra_QC/NASH_F34.mat');   
+
+REF{1} = NAFL_Stea; 
+REF{2} = NASH_F01; 
+REF{3} = NASH_F2; 
+REF{4} = NASH_F3; 
+REF{5} = NASH_F4;
+
+REF{6} = Stea_NASH_F01; 
+REF{7} = Stea_NASH_F012; 
+REF{8} = NASH_F23; 
+REF{9} = NASH_F34; 
+
+setRavenSolver('mosek')
+
+for ii=1:length(REF)
+prompt = 'Select a model for simulation!Enter a number between 1 to 9:';
+x = input(prompt); %% Enter the model number or the conditions from here:-
+
+model_ind = x; %% select models
+
+model = REF{ii};  
+Sol = simulate_PS_Obj(model,0)
+
+%printFluxes(model,Sol.x,true,10^-6,[],'%eqn\t%flux\n'); %% only exchange fluxes
+printFluxVector(model,Sol.x,1,1,[],[],[],1)
+Sol.obj
+model
+
+end
+
+disp("THE END ..... ")
+
+end
